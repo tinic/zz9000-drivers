@@ -74,6 +74,7 @@ const struct NSDeviceQueryResult NSDQueryAnswer = {
 #include "zzcfg_query.h"
 #include "macros.h"
 #include "rx.h"
+#include "tx.h"
 
 #if ZZNET_S2ERR_NO_RESOURCES != S2ERR_NO_RESOURCES || \
     ZZNET_S2ERR_BAD_STATE != S2ERR_BAD_STATE || \
@@ -93,6 +94,14 @@ const struct NSDeviceQueryResult NSDQueryAnswer = {
 static ULONG ZZ9K_REGS = 0;
 #define ZZ9K_RX 0x2000
 #define ZZ9K_TX 0x8000
+#define ZZ9K_TX_STATUS 0x68
+
+/* Status reads (about 1 us each, served by the ARM) a writer spends waiting
+ * for one of the four TX slots to retire before it gives up on the frame.
+ * Four full-size frames leave the wire in ~0.5 ms at 100 Mbit/s and ~5 ms at
+ * 10 Mbit/s; the firmware retires refused frames as well, so only a hung
+ * firmware reaches this. */
+#define ZZNET_TX_WAIT_READS 100000UL
 
 struct Sana2DeviceStats global_stats;
 BOOL is_online;
@@ -260,6 +269,11 @@ static LONG zznet_mcast_change(DEVBASETYPE *db, const UBYTE *addr, BOOL add)
 
 /* Unicast and broadcast do not consult the group table, so they do not
  * take db_McastSem. Group frames do: exact membership is the collision filter. */
+/* The presented frame's Ethernet header, read from the window once per
+ * frame by frame_proc (3 longwords and a word) and used from RAM. Only
+ * frame_proc touches it. */
+static ULONG zznet_rx_hdr[4];
+
 static struct zznet_rx_plan zznet_frame_plan(DEVBASETYPE *db,
                                              volatile const UBYTE *addr)
 {
@@ -380,6 +394,16 @@ SAVEDS struct Device *DevInit( ASMR(d0) DEVBASEP                  ASMREG(d0),
             D(("ZZ9000Net: Using firmware MAC.\n"));
           }
 
+          /* Firmware with the asynchronous TX path reports it in bit 15 of
+           * ETH_TX_STATUS; older firmware reads 0 there and keeps the
+           * synchronous send. */
+          InitSemaphore(&db->db_TxSem);
+          if (zznet_tx_reset(&db->db_Tx,
+                             *(volatile USHORT*)(ZZ9K_REGS+ZZ9K_TX_STATUS))) {
+            D(("ZZ9000Net: Using asynchronous TX.\n"));
+            db->db_Flags |= DEVF_TXASYNC;
+          }
+
           ok = 1;
 
         } else {
@@ -495,7 +519,7 @@ SAVEDS LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq           ASMREG(a1),
       if (port = CreateMsgPort()) {
         D(("ZZ9000Net: Starting Process\n"));
         if ((db->db_Proc = CreateNewProcTags(NP_Entry, (ULONG)frame_proc, NP_Name,
-                                             (ULONG)frame_proc_name, NP_Priority, 0, TAG_DONE))) {
+                                             (ULONG)frame_proc_name, NP_Priority, 10, TAG_DONE))) {
           InitSemaphore(&db->db_ProcExitSem);
 
           init.error = 1;
@@ -705,7 +729,8 @@ static void set_last_start()
 }
 
 ULONG read_frame(DEVBASETYPE *db, struct IOSana2Req *req, volatile UBYTE *frame, USHORT sz, USHORT tp);
-ULONG write_frame(struct IOSana2Req *req, UBYTE *frame);
+ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slot);
+static ULONG write_frame_async(DEVBASETYPE *db, struct IOSana2Req *req);
 
 SAVEDS VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq       ASMREG(a1),
                             ASMR(a6) DEVBASEP                       ASMREG(a6) )
@@ -751,7 +776,9 @@ SAVEDS VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq       ASMREG(a1),
     }
     /* fall through */
   case CMD_WRITE: {
-    ULONG res = write_frame(ioreq, (UBYTE*)(ZZ9K_REGS+ZZ9K_TX));
+    ULONG res = (db->db_Flags & DEVF_TXASYNC)
+        ? write_frame_async(db, ioreq)
+        : write_frame(db, ioreq, (UBYTE*)(ZZ9K_REGS+ZZ9K_TX), -1);
     if (res!=0) {
       ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
       ioreq->ios2_WireError = S2WERR_GENERIC_ERROR;
@@ -935,6 +962,26 @@ static uint16_t zznet_rx_hw_status(void *ctx)
 	return *(volatile USHORT *)(ZZ9K_REGS + ZZ_REG_ETH_RX_STATUS);
 }
 
+/* 32 bytes per block, eight registers in and out: on a 68060 reading the
+ * Zorro III RX window the per-longword loop spends as much on instructions
+ * as on the bus.  `blocks` is at least 1. */
+static void zznet_copy_blocks(ULONG *dst, volatile ULONG *src, ULONG blocks)
+{
+	register ULONG *d __asm__("a0") = dst;
+	register volatile ULONG *s __asm__("a1") = src;
+	register ULONG n __asm__("d0") = blocks;
+
+	__asm__ volatile(
+		"1:	movem.l (%1)+,%%d1-%%d7/%%a2\n"
+		"	movem.l %%d1-%%d7/%%a2,(%0)\n"
+		"	lea 32(%0),%0\n"
+		"	subq.l #1,%2\n"
+		"	bne.s 1b\n"
+		: "+a"(d), "+a"(s), "+d"(n)
+		:
+		: "d1", "d2", "d3", "d4", "d5", "d6", "d7", "a2", "cc", "memory");
+}
+
 static const struct zznet_rx_io zznet_rx_hw = {
 	zznet_rx_hw_header,
 	zznet_rx_hw_status,
@@ -983,6 +1030,12 @@ static inline UBYTE* zznet_mmio_read_block(volatile UBYTE *src, UBYTE *base, ULO
 		volatile ULONG *ls = (volatile ULONG*)src;
 		ULONG          *ld = (ULONG*)dst;
 		ULONG longs = n >> 2;
+		if (longs >= 8) {
+			zznet_copy_blocks(ld, ls, longs >> 3);
+			ld += longs & ~7UL;
+			ls += longs & ~7UL;
+			longs &= 7;
+		}
 		while (longs--) *ld++ = *ls++;
 		src = (volatile UBYTE*)ls;
 		dst = (UBYTE*)ld;
@@ -1133,7 +1186,10 @@ ULONG read_frame(DEVBASETYPE *db, struct IOSana2Req *req, volatile UBYTE *frame,
 	return err;
 }
 
-ULONG write_frame(struct IOSana2Req *req, UBYTE *frame)
+/* slot < 0: the synchronous send from the start of the TX window. slot
+ * 0..3: an asynchronous send from that slot, which the caller has taken
+ * from db_Tx under db_TxSem. */
+ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slot)
 {
 	struct BufferManagement *bm;
 	USHORT sz = 0;
@@ -1185,6 +1241,16 @@ ULONG write_frame(struct IOSana2Req *req, UBYTE *frame)
 		}
 	}
 
+	if (slot >= 0) {
+		/* Queued, not sent: the bus cycle returns at once and the slot
+		 * stays the firmware's until ETH_TX_STATUS retires it. A refused
+		 * submission is retired the same way and cannot be told apart
+		 * from a sent one, so there is no result to read back. */
+		*(volatile USHORT*)(ZZ9K_REGS+0x80) = zznet_tx_word(slot, sz);
+		zznet_tx_submitted(&db->db_Tx);
+		return 0;
+	}
+
 	{
 		volatile USHORT *reg = (volatile USHORT*)(ZZ9K_REGS+0x80);
 		*reg = sz;      /* kick the TX engine */
@@ -1194,6 +1260,36 @@ ULONG write_frame(struct IOSana2Req *req, UBYTE *frame)
 		}
 	}
 
+	return rc;
+}
+
+/* Asynchronous send: take the next TX slot in submission order, waiting
+ * for the firmware to retire the oldest one while all four are in flight.
+ * A slot is reused only after ETH_TX_STATUS has counted its frame, so the
+ * copy into it can never overwrite a frame the GEM is still reading. */
+static ULONG write_frame_async(DEVBASETYPE *db, struct IOSana2Req *req)
+{
+	ULONG rc = 1;
+	ULONG reads;
+	int slot;
+
+	/* A frame longer than a slot would run into the next one. */
+	if (req->ios2_DataLength > HW_ETH_MAX_RAW)
+		return 1;
+
+	ObtainSemaphore(&db->db_TxSem);
+	for (reads = 0; (slot = zznet_tx_slot(&db->db_Tx)) < 0 &&
+	                reads < ZZNET_TX_WAIT_READS; reads++)
+		zznet_tx_reclaim(&db->db_Tx,
+		                 *(volatile USHORT*)(ZZ9K_REGS+ZZ9K_TX_STATUS));
+	if (slot >= 0) {
+		rc = write_frame(db, req,
+		                 (UBYTE*)(ZZ9K_REGS + ZZ9K_TX +
+		                          (ULONG)slot * ZZNET_TX_SLOT_SIZE), slot);
+	} else {
+		D(("tx: no slot retired\n"));
+	}
+	ReleaseSemaphore(&db->db_TxSem);
 	return rc;
 }
 
@@ -1263,7 +1359,11 @@ SAVEDS void frame_proc() {
       continue;
     }
 
-    USHORT packet_type = *(volatile USHORT*)(frm + 16);
+    zznet_rx_hdr[0] = *(volatile ULONG*)(frm + 4);
+    zznet_rx_hdr[1] = *(volatile ULONG*)(frm + 8);
+    zznet_rx_hdr[2] = *(volatile ULONG*)(frm + 12);
+    zznet_rx_hdr[3] = (ULONG)*(volatile USHORT*)(frm + 16) << 16;
+    USHORT packet_type = (USHORT)(zznet_rx_hdr[3] >> 16);
     struct IOSana2Req *match = NULL;
 
     /* GEM hash collisions are not unknown packet types. Ack and drop
@@ -1271,7 +1371,7 @@ SAVEDS void frame_proc() {
      * stays reserved for an accepted frame with no reader or a failed
      * read. */
     {
-      struct zznet_rx_plan plan = zznet_frame_plan(db, frm + 4);
+      struct zznet_rx_plan plan = zznet_frame_plan(db, (const UBYTE *)zznet_rx_hdr);
 
       if (!plan.select_reader) {
         if (plan.count_unknown)
