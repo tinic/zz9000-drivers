@@ -588,9 +588,15 @@ SAVEDS struct Device *DevInit( ASMR(d0) DEVBASEP                  ASMREG(d0),
 
           /* Firmware without these registers reads 0: no checksum verdict,
            * and the 32-frame receive ring. */
-          db->db_ExtOffer = zznet_ext_offer(
-              *(volatile USHORT*)(ZZ9K_REGS+ZZNET_RX_META),
-              (db->db_Flags & DEVF_TXASYNC) != 0);
+          {
+            USHORT rx_meta = *(volatile USHORT*)(ZZ9K_REGS+ZZNET_RX_META);
+
+            if ((db->db_Flags & DEVF_TXASYNC) &&
+                (rx_meta & ZZNET_RX_META_TX_OFFSET2))
+              db->db_Flags |= DEVF_TXSHIFT;
+            db->db_ExtOffer = zznet_ext_offer(rx_meta,
+                (db->db_Flags & DEVF_TXASYNC) != 0);
+          }
           db->db_RxCapacity = zznet_ext_rx_capacity(
               *(volatile USHORT*)(ZZ9K_REGS+ZZNET_RX_FRAMES));
 
@@ -1756,7 +1762,10 @@ ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slo
 		}
 	}
 
-	if (txf & (ANXD_S2_TXF_TCP | ANXD_S2_TXF_UDP))
+	/* A shifted frame's checksum field is zeroed by the firmware on
+	 * consent (ETH_TX bit 13), without the 68k touching the window. */
+	if ((txf & (ANXD_S2_TXF_TCP | ANXD_S2_TXF_UDP)) &&
+	    !(slot >= 0 && (db->db_Flags & DEVF_TXSHIFT)))
 		zznet_tx_csum(bm, req, start, sz, txf);
 
 	if (slot >= 0) {
@@ -1769,14 +1778,21 @@ ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slo
 		 * start is held until the run ends (ANXD_CMD_TX_FLUSH), a write
 		 * without the flag, all four slots holding frames, or the next
 		 * vertical blank; the frames then leave together. */
+		USHORT word = zznet_tx_word(slot, sz);
+
+		if (db->db_Flags & DEVF_TXSHIFT) {
+			word |= ZZNET_TX_OFFSET2;
+			if (txf & (ANXD_S2_TXF_TCP | ANXD_S2_TXF_UDP))
+				word |= ZZNET_TX_CSUM;
+		}
 		if (txf & ANXD_S2_TXF_MORE) {
-			zznet_tx_hold(&db->db_Tx, zznet_tx_word(slot, sz));
+			zznet_tx_hold(&db->db_Tx, word);
 			if (db->db_Tx.held >= ZZNET_TX_SLOTS)
 				zznet_tx_flush(db);
 			return 0;
 		}
 		zznet_tx_flush(db);
-		*(volatile USHORT*)(ZZ9K_REGS+0x80) = zznet_tx_word(slot, sz);
+		*(volatile USHORT*)(ZZ9K_REGS+0x80) = word;
 		zznet_tx_submitted(&db->db_Tx);
 		return 0;
 	}
@@ -1825,9 +1841,14 @@ static ULONG write_frame_async(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE tx
 		                 *(volatile USHORT*)(ZZ9K_REGS+ZZ9K_TX_STATUS));
 	}
 	if (slot >= 0) {
+		/* Shifted, the frame starts 2 bytes into the slot and the
+		 * stack's CopyFromBuff writes the IP payload to a longword
+		 * aligned card address. */
 		rc = write_frame(db, req,
 		                 (UBYTE*)(ZZ9K_REGS + ZZ9K_TX +
-		                          (ULONG)slot * ZZNET_TX_SLOT_SIZE), slot, txf);
+		                          (ULONG)slot * ZZNET_TX_SLOT_SIZE +
+		                          ((db->db_Flags & DEVF_TXSHIFT) ? 2 : 0)),
+		                 slot, txf);
 	} else {
 		D(("tx: no slot retired\n"));
 	}

@@ -15,7 +15,8 @@
  *                         3 IP+UDP); the GEM discards frames it found bad.
  *                         Bit 14 = transmit checksum insertion on: a zeroed
  *                         TCP/UDP checksum field of an IPv4 frame is filled
- *                         in by the GEM.
+ *                         in by the GEM. Bit 13 = shifted TX slots with
+ *                         per-frame checksum consent (tx.h).
  */
 #ifndef ZZNET_EXT_H
 #define ZZNET_EXT_H
@@ -51,6 +52,7 @@
 #define ZZNET_RX_META           0xA6
 #define ZZNET_RX_META_PRESENT   0x8000
 #define ZZNET_RX_META_TX_CSUM   0x4000
+#define ZZNET_RX_META_TX_OFFSET2 0x2000
 #define ZZNET_RX_META_VERDICT   0x0003
 #define ZZNET_RX_META_TCP       2
 #define ZZNET_RX_META_UDP       3

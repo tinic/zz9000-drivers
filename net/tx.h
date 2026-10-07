@@ -18,6 +18,16 @@
  *                               the count is the number of oldest slots the
  *                               driver may reuse.
  *   ETH_TX write, bit 15 clear  the synchronous send, not counted.
+ *   ETH_TX bit 14 (OFFSET2)     asynchronous only, when ETH_RX_META bit 13
+ *                               says the firmware has it: the frame starts
+ *                               2 bytes into its slot, so the IP header
+ *                               after the Ethernet header is longword
+ *                               aligned in the window
+ *   ETH_TX bit 13 (CSUM)        shifted frames only: consent to checksum
+ *                               insertion. The TCP/UDP checksum field holds
+ *                               the opener's pseudo-header seed and the
+ *                               firmware zeroes it for the GEM; without the
+ *                               bit the frame goes exactly as written.
  */
 #ifndef ZZNET_TX_H
 #define ZZNET_TX_H
@@ -25,6 +35,8 @@
 #include <stdint.h>
 
 #define ZZNET_TX_ASYNC          0x8000
+#define ZZNET_TX_OFFSET2        0x4000
+#define ZZNET_TX_CSUM           0x2000
 #define ZZNET_TX_SLOT_SHIFT     11
 #define ZZNET_TX_LEN_MASK       0x07ff
 #define ZZNET_TX_SLOTS          4
