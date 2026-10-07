@@ -40,8 +40,10 @@
 #include <exec/libraries.h>
 #include <exec/devices.h>
 #include <exec/semaphores.h>
+#include <exec/interrupts.h>
 #include "debug.h"
 #include "sana2.h"
+#include "anxs2ext.h"
 
 /* reassign Library bases from global definitions to own struct */
 #define SysBase       db->db_SysBase
@@ -93,6 +95,26 @@ struct devbase {
 	 * owned by the firmware, so their slots must retire before reuse. */
 	struct zznet_tx_state db_Tx;
 	struct SignalSemaphore db_TxSem;
+
+	/* AmiNetXDuo SANA-II extension: what this card offers an opener, and
+	 * the ANXD_CMD_RX_CAPACITY answer, both read from the firmware once
+	 * in DevInit. */
+	ULONG db_ExtOffer;
+	ULONG db_RxCapacity;
+
+	/* Every opener's BufferManagement (bm_Node), under db_ReadListSem. */
+	struct List db_Openers;
+	/* frame_proc left the presented frame in the card for the sole
+	 * opener's next read (anxs2ext.h, ANXD_CMD_RX_POLL); under
+	 * db_ReadListSem. Whoever posts a read, polls, opens or closes wakes
+	 * frame_proc while it is set. */
+	UBYTE db_RxBehind;
+	/* An RX batch took a frame this pass and is still queued. */
+	UBYTE db_BatchPending;
+	/* TX_MORE backstop: a vertical-blank server that wakes frame_proc to
+	 * start held frames, installed while any opener accepted TX_MORE. */
+	UBYTE db_VblOn;
+	struct Interrupt db_VblInt;
 
 	struct DevUnit db_Units[MAX_UNITS]; /* unused in construct */
 };
@@ -156,6 +178,13 @@ typedef struct BufferManagement
   struct MinNode   bm_Node;
   BMFunc           bm_CopyFromBuffer;
   BMFunc           bm_CopyToBuffer;
+  /* The opener's accepted ANXD_S2_EXTENSION record, or NULL. */
+  AnxdS2Extension *bm_Ext;
+  ULONG            bm_ExtAccepted;
+  /* Packet types this direct-receive opener has read, so a frame of one
+   * of them can wait in the card while its reads are being re-posted. */
+  UWORD            bm_NTypes;
+  UWORD            bm_Types[8];
 } BufferManagement;
 
 struct HWFrame {

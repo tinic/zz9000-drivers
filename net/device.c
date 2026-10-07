@@ -75,6 +75,7 @@ const struct NSDeviceQueryResult NSDQueryAnswer = {
 #include "macros.h"
 #include "rx.h"
 #include "tx.h"
+#include "ext.h"
 
 #if ZZNET_S2ERR_NO_RESOURCES != S2ERR_NO_RESOURCES || \
     ZZNET_S2ERR_BAD_STATE != S2ERR_BAD_STATE || \
@@ -89,6 +90,31 @@ const struct NSDeviceQueryResult NSDQueryAnswer = {
 #if ZZNET_RX_MIN_FRAME != HW_ETH_HDR_SIZE || ZZNET_RX_MAX_FRAME != HW_ETH_MAX_RAW
 #error RX slot model drifted from the driver frame size bounds
 #endif
+
+#if ZZNET_EXT_VERSION != ANXD_S2_ABI_VERSION || \
+    ZZNET_EXT_RX_DIRECT != ANXD_S2F_RX_DIRECT || \
+    ZZNET_EXT_RX_LINK_HDR != ANXD_S2F_RX_LINK_HDR || \
+    ZZNET_EXT_RX_VERIFIED != ANXD_S2F_RX_VERIFIED || \
+    ZZNET_EXT_TX_CSUM_TCP != ANXD_S2F_TX_CSUM_TCP || \
+    ZZNET_EXT_TX_CSUM_UDP != ANXD_S2F_TX_CSUM_UDP || \
+    ZZNET_EXT_RX_CAPACITY != ANXD_S2F_RX_CAPACITY || \
+    ZZNET_EXT_TX_QUICK != ANXD_S2F_TX_QUICK || \
+    ZZNET_EXT_RX_POLL != ANXD_S2F_RX_POLL || \
+    ZZNET_EXT_RX_BATCH != ANXD_S2F_RX_BATCH || \
+    ZZNET_EXT_TX_MORE != ANXD_S2F_TX_MORE || \
+    ZZNET_EXT_RXF_SUMMED != ANXD_S2_RXF_SUMMED || \
+    ZZNET_EXT_RXF_VERIFIED != ANXD_S2_RXF_VERIFIED || \
+    ZZNET_EXT_TXF_TCP != ANXD_S2_TXF_TCP || \
+    ZZNET_EXT_TXF_UDP != ANXD_S2_TXF_UDP || \
+    ZZNET_EXT_TXF_MORE != ANXD_S2_TXF_MORE || \
+    ZZNET_EXT_BATCH_VERSION != ANXD_S2_RX_BATCH_VERSION || \
+    ZZNET_EXT_BATCH_MAX != ANXD_S2_RX_BATCH_MAX
+#error extension model drifted from anxs2ext.h
+#endif
+_Static_assert(ZZNET_EXT_MIN_SIZE == ANXD_S2_EXTENSION_SIZE,
+               "extension model drifted from anxs2ext.h");
+_Static_assert(ANXD_S2_RX_BATCH_SIZE(0) == 8,
+               "extension model drifted from anxs2ext.h");
 
 // FIXME get rid of global var!
 static ULONG ZZ9K_REGS = 0;
@@ -210,6 +236,7 @@ static int zznet_parse_ip_tcp(volatile const UBYTE *ip, ULONG len,
 #define RX_STAGE_SIZE 1536
 
 SAVEDS void frame_proc();
+static void zznet_tx_flush(DEVBASETYPE *db);
 char *frame_proc_name = "ZZ9000NetFramer";
 
 /* ZZ9000 interrupt server (INT6 default, optional INT2).
@@ -233,6 +260,14 @@ SAVEDS ULONG dev_isr(struct devbase* db __asm("a1")) {
     Signal((struct Task*)db->db_Proc, SIGBREAKF_CTRL_F);
   }
   return 1;
+}
+
+/* TX_MORE backstop at vertical blank: wake frame_proc to start frames
+ * whose start was held. Never ours alone, so always chains on. */
+SAVEDS ULONG zznet_vbl(struct devbase* db __asm("a1")) {
+  if (db->db_Tx.held && db->db_Proc)
+    Signal((struct Task*)db->db_Proc, SIGBREAKF_CTRL_E);
+  return 0;
 }
 
 static UBYTE HW_MAC[] = {0x00,0x00,0x00,0x00,0x00,0x00};
@@ -312,6 +347,151 @@ void set_mac_from_string(UBYTE* buf) {
 
     k+=3;
   }
+}
+
+/* AmiNetXDuo SANA-II extension (anxs2ext.h): the first ANXD_S2_EXTENSION
+ * record of a known Version and Size in the open taglist is answered with
+ * what this card can honour; later records are ignored. An opener without
+ * one, or with an invalid one, is a plain SANA-II opener. */
+static void zznet_ext_negotiate(DEVBASETYPE *db, struct BufferManagement *bm,
+                                struct TagItem *tags)
+{
+	struct TagItem *state = tags;
+	struct TagItem *ti;
+
+	while ((ti = NextTagItem(&state))) {
+		AnxdS2Extension *ext = (AnxdS2Extension *)ti->ti_Data;
+		ULONG accepted;
+
+		if (ti->ti_Tag != ANXD_S2_EXTENSION || !ext)
+			continue;
+		if (!zznet_ext_accept(ext->Version, ext->Size, ext->Request,
+		                      db->db_ExtOffer,
+		                      ((ext->RxDirect && ext->RxFilled) ?
+		                       ZZNET_EXT_HAVE_RX_CB : 0) |
+		                      (ext->TxFlags ? ZZNET_EXT_HAVE_TX_CB : 0) |
+		                      (bm->bm_CopyToBuffer ? ZZNET_EXT_HAVE_COPYTO : 0),
+		                      &accepted))
+			continue;
+		ext->Accepted = accepted;
+		bm->bm_Ext = ext;
+		bm->bm_ExtAccepted = accepted;
+		D(("ZZ9000Net: extension accepted %lx\n", accepted));
+		break;
+	}
+
+	/* A held TX start waits one vertical blank at most. */
+	if ((bm->bm_ExtAccepted & ANXD_S2F_TX_MORE) && !db->db_VblOn) {
+		db->db_VblInt.is_Node.ln_Type = NT_INTERRUPT;
+		db->db_VblInt.is_Node.ln_Pri = 0;
+		db->db_VblInt.is_Node.ln_Name = "ZZ9000Net TX";
+		db->db_VblInt.is_Data = (APTR)db;
+		db->db_VblInt.is_Code = (void(*)())zznet_vbl;
+		AddIntServer(INTB_VERTB, &db->db_VblInt);
+		db->db_VblOn = 1;
+	}
+}
+
+/* Wake frame_proc when it left a frame in the card for a read that may
+ * now be there, or for an opener set that changed. */
+static void zznet_rx_kick(DEVBASETYPE *db)
+{
+	if (db->db_RxBehind && db->db_Proc)
+		Signal((struct Task*)db->db_Proc, SIGBREAKF_CTRL_F);
+}
+
+/* Reply every queued request of `bm` that `match` selects (all of them
+ * when match is 0, else RX batches only) with `err`; under db_ReadListSem
+ * for the list walk, replied outside it. */
+static void zznet_reply_reads(DEVBASETYPE *db, struct BufferManagement *bm,
+                              BOOL batches_only, BYTE err, ULONG wire)
+{
+	struct Node *done = NULL, *n, *next;
+
+	ObtainSemaphore(&db->db_ReadListSem);
+	for (n = db->db_ReadList.lh_Head; (next = n->ln_Succ); n = next) {
+		struct IOSana2Req *io = (struct IOSana2Req *)n;
+
+		if ((bm && io->ios2_BufferManagement != bm) ||
+		    (batches_only && io->ios2_Req.io_Command != ANXD_CMD_RX_BATCH))
+			continue;
+		Remove(n);
+		n->ln_Succ = done;   /* chained for the reply below */
+		done = n;
+	}
+	ReleaseSemaphore(&db->db_ReadListSem);
+	while ((n = done)) {
+		struct IOSana2Req *io = (struct IOSana2Req *)n;
+
+		done = n->ln_Succ;
+		io->ios2_Req.io_Error = err;
+		io->ios2_WireError = wire;
+		ReplyMsg((struct Message *)io);
+	}
+}
+
+/* The end of an RX pass: every batch that took a frame and is still
+ * queued is answered now, so no frame waits in a batch for a later pass.
+ * Only frame_proc calls this. */
+static void zznet_batch_flush(DEVBASETYPE *db)
+{
+	struct Node *done = NULL, *n, *next;
+
+	if (!db->db_BatchPending)
+		return;
+	db->db_BatchPending = 0;
+	ObtainSemaphore(&db->db_ReadListSem);
+	for (n = db->db_ReadList.lh_Head; (next = n->ln_Succ); n = next) {
+		struct IOSana2Req *io = (struct IOSana2Req *)n;
+
+		if (io->ios2_Req.io_Command == ANXD_CMD_RX_BATCH &&
+		    ((AnxdS2RxBatch *)io->ios2_Data)->Filled != 0) {
+			Remove(n);
+			n->ln_Succ = done;
+			done = n;
+		}
+	}
+	ReleaseSemaphore(&db->db_ReadListSem);
+	while ((n = done)) {
+		done = n->ln_Succ;
+		((struct IOSana2Req *)n)->ios2_Req.io_Error = 0;
+		((struct IOSana2Req *)n)->ios2_WireError = 0;
+		ReplyMsg((struct Message *)n);
+	}
+}
+
+/* Remember a packet type a direct-receive opener reads. Under
+ * db_ReadListSem. */
+static void zznet_note_type(struct BufferManagement *bm, USHORT type)
+{
+	UWORD i;
+
+	if (!(bm->bm_ExtAccepted & ANXD_S2F_RX_DIRECT))
+		return;
+	for (i = 0; i < bm->bm_NTypes; i++)
+		if (bm->bm_Types[i] == type)
+			return;
+	if (bm->bm_NTypes < sizeof(bm->bm_Types) / sizeof(bm->bm_Types[0]))
+		bm->bm_Types[bm->bm_NTypes++] = type;
+}
+
+/* A frame of `type` found no posted read. Leave it in the card when the
+ * unit's sole opener receives directly and has been reading this type:
+ * its reader is behind rather than gone, and the card's ring holds the
+ * frame until the read comes. Never with a second opener, whose traffic
+ * the held frame would block. Under db_ReadListSem. */
+static BOOL zznet_rx_hold(DEVBASETYPE *db, USHORT type)
+{
+	struct BufferManagement *bm =
+	    (struct BufferManagement *)db->db_Openers.lh_Head;
+	UWORD i;
+
+	if (!bm->bm_Node.mln_Succ || bm->bm_Node.mln_Succ->mln_Succ)
+		return FALSE;
+	for (i = 0; i < bm->bm_NTypes; i++)
+		if (bm->bm_Types[i] == type)
+			return TRUE;
+	return FALSE;
 }
 
 struct ProcInit
@@ -398,11 +578,21 @@ SAVEDS struct Device *DevInit( ASMR(d0) DEVBASEP                  ASMREG(d0),
            * ETH_TX_STATUS; older firmware reads 0 there and keeps the
            * synchronous send. */
           InitSemaphore(&db->db_TxSem);
+          InitSemaphore(&db->db_ReadListSem);
+          NEWLIST(&db->db_Openers);
           if (zznet_tx_reset(&db->db_Tx,
                              *(volatile USHORT*)(ZZ9K_REGS+ZZ9K_TX_STATUS))) {
             D(("ZZ9000Net: Using asynchronous TX.\n"));
             db->db_Flags |= DEVF_TXASYNC;
           }
+
+          /* Firmware without these registers reads 0: no checksum verdict,
+           * and the 32-frame receive ring. */
+          db->db_ExtOffer = zznet_ext_offer(
+              *(volatile USHORT*)(ZZ9K_REGS+ZZNET_RX_META),
+              (db->db_Flags & DEVF_TXASYNC) != 0);
+          db->db_RxCapacity = zznet_ext_rx_capacity(
+              *(volatile USHORT*)(ZZ9K_REGS+ZZNET_RX_FRAMES));
 
           ok = 1;
 
@@ -474,6 +664,7 @@ SAVEDS LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq           ASMREG(a1),
     if ((bm = (struct BufferManagement*)AllocVec(sizeof(struct BufferManagement), MEMF_CLEAR|MEMF_PUBLIC))) {
       bm->bm_CopyToBuffer = (BMFunc)GetTagData(S2_CopyToBuff, 0, (struct TagItem *)ioreq->ios2_BufferManagement);
       bm->bm_CopyFromBuffer = (BMFunc)GetTagData(S2_CopyFromBuff, 0, (struct TagItem *)ioreq->ios2_BufferManagement);
+      zznet_ext_negotiate(db, bm, (struct TagItem *)ioreq->ios2_BufferManagement);
 
       ioreq->ios2_BufferManagement = (VOID *)bm;
       ioreq->ios2_Req.io_Error = 0;
@@ -609,6 +800,11 @@ SAVEDS LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq           ASMREG(a1),
 	if (ok) {
 		ret = 0;
     db->db_Lib.lib_Flags &= ~LIBF_DELEXP;
+
+    ObtainSemaphore(&db->db_ReadListSem);
+    AddTail(&db->db_Openers, (struct Node *)bm);
+    zznet_rx_kick(db);
+    ReleaseSemaphore(&db->db_ReadListSem);
 	}
 
 	if (ret == IOERR_OPENFAIL) {
@@ -639,7 +835,16 @@ SAVEDS BPTR DevClose(   ASMR(a1) struct IORequest *ioreq        ASMREG(a1),
 	 * previously this was leaked on every close. */
 	{
 		struct IOSana2Req *s2 = (struct IOSana2Req *)ioreq;
-		if (s2->ios2_BufferManagement) {
+		struct BufferManagement *bm = s2->ios2_BufferManagement;
+		if (bm) {
+			ObtainSemaphore(&db->db_ReadListSem);
+			Remove((struct Node *)bm);
+			zznet_rx_kick(db);
+			ReleaseSemaphore(&db->db_ReadListSem);
+			/* anxs2ext.h: CloseDevice answers an extension opener's
+			 * reads and batches still queued. */
+			if (bm->bm_Ext)
+				zznet_reply_reads(db, bm, FALSE, IOERR_ABORTED, 0);
 			FreeVec(s2->ios2_BufferManagement);
 			s2->ios2_BufferManagement = NULL;
 		}
@@ -669,6 +874,15 @@ SAVEDS BPTR DevClose(   ASMR(a1) struct IORequest *ioreq        ASMREG(a1),
       ObtainSemaphore(&db->db_ProcExitSem);
       ReleaseSemaphore(&db->db_ProcExitSem);
     }
+
+    if (db->db_VblOn) {
+      RemIntServer(INTB_VERTB, &db->db_VblInt);
+      db->db_VblOn = 0;
+    }
+    /* Nobody is left to flush a held TX run. */
+    ObtainSemaphore(&db->db_TxSem);
+    zznet_tx_flush(db);
+    ReleaseSemaphore(&db->db_TxSem);
 
     /* No RX worker can be consulting the group table past this point. */
     zznet_mcast_reset(&db->db_Mcast, &zznet_mcast_hw);
@@ -729,8 +943,10 @@ static void set_last_start()
 }
 
 ULONG read_frame(DEVBASETYPE *db, struct IOSana2Req *req, volatile UBYTE *frame, USHORT sz, USHORT tp);
-ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slot);
-static ULONG write_frame_async(DEVBASETYPE *db, struct IOSana2Req *req);
+ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slot, UBYTE txf);
+static ULONG write_frame_async(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE txf);
+static ULONG zznet_rx_batch(struct IOSana2Req *req, volatile UBYTE *frame,
+                            USHORT sz, USHORT tp);
 
 SAVEDS VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq       ASMREG(a1),
                             ASMR(a6) DEVBASEP                       ASMREG(a6) )
@@ -756,6 +972,8 @@ SAVEDS VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq       ASMREG(a1),
       ioreq->ios2_Req.io_Flags &= ~SANA2IOF_QUICK;
       ObtainSemaphore(&db->db_ReadListSem);
       AddHead((struct List*)&db->db_ReadList, (struct Node*)ioreq);
+      zznet_note_type(ioreq->ios2_BufferManagement, ioreq->ios2_PacketType);
+      zznet_rx_kick(db);
       ReleaseSemaphore(&db->db_ReadListSem);
       ioreq = NULL;
     }
@@ -776,9 +994,23 @@ SAVEDS VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq       ASMREG(a1),
     }
     /* fall through */
   case CMD_WRITE: {
-    ULONG res = (db->db_Flags & DEVF_TXASYNC)
-        ? write_frame_async(db, ioreq)
-        : write_frame(db, ioreq, (UBYTE*)(ZZ9K_REGS+ZZ9K_TX), -1);
+    struct BufferManagement *bm = (struct BufferManagement *)ioreq->ios2_BufferManagement;
+    UBYTE txf = 0;
+    ULONG res;
+
+    /* anxs2ext.h: per-write metadata from the opener's TxFlags, only when
+     * it was granted a transmit feature the flags govern. */
+    if (bm->bm_ExtAccepted & (ANXD_S2F_TX_CSUM_TCP | ANXD_S2F_TX_CSUM_UDP |
+                              ANXD_S2F_TX_MORE)) {
+      UBYTE f = bm->bm_Ext->TxFlags(ioreq->ios2_Data);
+
+      if (bm->bm_ExtAccepted & ANXD_S2F_TX_CSUM_TCP) txf |= f & ANXD_S2_TXF_TCP;
+      if (bm->bm_ExtAccepted & ANXD_S2F_TX_CSUM_UDP) txf |= f & ANXD_S2_TXF_UDP;
+      if (bm->bm_ExtAccepted & ANXD_S2F_TX_MORE)     txf |= f & ANXD_S2_TXF_MORE;
+    }
+    res = (db->db_Flags & DEVF_TXASYNC)
+        ? write_frame_async(db, ioreq, txf)
+        : write_frame(db, ioreq, (UBYTE*)(ZZ9K_REGS+ZZ9K_TX), -1, txf);
     if (res!=0) {
       ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
       ioreq->ios2_WireError = S2WERR_GENERIC_ERROR;
@@ -834,6 +1066,8 @@ SAVEDS VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq       ASMREG(a1),
     break;
   case S2_OFFLINE:
     is_online = FALSE;
+    /* anxs2ext.h: going offline answers queued RX batches. */
+    zznet_reply_reads(db, NULL, TRUE, S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE);
     break;
 
   case S2_GETSTATIONADDRESS:
@@ -883,6 +1117,91 @@ SAVEDS VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq       ASMREG(a1),
       }
     }
     break;
+  case ANXD_CMD_RX_BATCH:
+    {
+      /* Many frames for one request (anxs2ext.h): queued like a CMD_READ
+       * of its type, each frame into the next cookie through the direct
+       * path, replied when full or at the end of the pass that filled
+       * its first slot. Refused at once for a bad record, a raw request
+       * or an opener that was not granted it. */
+      struct BufferManagement *bm = (struct BufferManagement *)ioreq->ios2_BufferManagement;
+      AnxdS2RxBatch *b = (AnxdS2RxBatch *)ioreq->ios2_Data;
+
+      if (!bm || !(bm->bm_ExtAccepted & ANXD_S2F_RX_BATCH) ||
+          (ioreq->ios2_Req.io_Flags & SANA2IOF_RAW)) {
+        ioreq->ios2_Req.io_Error = S2ERR_NOT_SUPPORTED;
+        ioreq->ios2_WireError = S2WERR_GENERIC_ERROR;
+        break;
+      }
+      if (!b) {
+        ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+        ioreq->ios2_WireError = S2WERR_NULL_POINTER;
+        break;
+      }
+      if (!zznet_ext_batch_ok(b->Version, b->Size, b->Count, sizeof(APTR))) {
+        ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+        ioreq->ios2_WireError = S2WERR_GENERIC_ERROR;
+        break;
+      }
+      b->Filled = 0;
+      ioreq->ios2_DataLength = 0;
+      ioreq->ios2_Req.io_Flags &= ~SANA2IOF_QUICK;
+      ObtainSemaphore(&db->db_ReadListSem);
+      AddHead((struct List*)&db->db_ReadList, (struct Node*)ioreq);
+      zznet_note_type(bm, ioreq->ios2_PacketType);
+      zznet_rx_kick(db);
+      ReleaseSemaphore(&db->db_ReadListSem);
+      ioreq = NULL;
+      break;
+    }
+  case ANXD_CMD_RX_POLL:
+    {
+      /* The opener re-posted its reads and is about to sleep: if a frame
+       * waits in the card for one, wake the framer to deliver it now. The
+       * framer is the only context that drains the card here, so the
+       * poll hands it the work instead of draining from the caller. */
+      struct BufferManagement *bm = (struct BufferManagement *)ioreq->ios2_BufferManagement;
+
+      if (bm && (bm->bm_ExtAccepted & ANXD_S2F_RX_POLL)) {
+        if (is_online) {
+          ObtainSemaphore(&db->db_ReadListSem);
+          zznet_rx_kick(db);
+          ReleaseSemaphore(&db->db_ReadListSem);
+        }
+        break;
+      }
+      ioreq->ios2_Req.io_Error = S2ERR_NOT_SUPPORTED;
+      ioreq->ios2_WireError = S2WERR_GENERIC_ERROR;
+      break;
+    }
+  case ANXD_CMD_TX_FLUSH:
+    {
+      /* Start what a run of ANXD_S2_TXF_MORE writes left held. Holding
+       * is per unit: every opener's held frames start. */
+      struct BufferManagement *bm = (struct BufferManagement *)ioreq->ios2_BufferManagement;
+
+      if (bm && (bm->bm_ExtAccepted & ANXD_S2F_TX_MORE)) {
+        ObtainSemaphore(&db->db_TxSem);
+        zznet_tx_flush(db);
+        ReleaseSemaphore(&db->db_TxSem);
+        break;
+      }
+      ioreq->ios2_Req.io_Error = S2ERR_NOT_SUPPORTED;
+      ioreq->ios2_WireError = S2WERR_GENERIC_ERROR;
+      break;
+    }
+  case ANXD_CMD_RX_CAPACITY:
+    {
+      struct BufferManagement *bm = (struct BufferManagement *)ioreq->ios2_BufferManagement;
+
+      /* Only for an opener that negotiated it; anyone else gets the
+       * unknown-command answer below. */
+      if (bm && (bm->bm_ExtAccepted & ANXD_S2F_RX_CAPACITY)) {
+        ioreq->ios2_DataLength = db->db_RxCapacity;
+        break;
+      }
+    }
+    /* fall through */
   default:
     {
       ioreq->ios2_Req.io_Error = S2ERR_NOT_SUPPORTED;
@@ -1053,6 +1372,171 @@ static inline UBYTE* zznet_mmio_read_block(volatile UBYTE *src, UBYTE *base, ULO
 	return dst_start;
 }
 
+/* MMIO payload copy straight into the opener's RxDirect buffer, returning
+ * the payload's ones-complement sum (big-endian 16-bit lanes, an odd last
+ * byte padded with a zero low byte, accumulated in 32 bits with end-around
+ * carry) when `sum` is set. `src` is the payload in the RX window at
+ * frame+18, 2 mod 4; `dst` is only promised even. One leading word puts
+ * the source on a longword, so every Zorro read in the bulk is an aligned
+ * longword; the 68020+ takes the possibly misaligned RAM store in its
+ * stride. Every lane starts at an even payload offset, so summing words
+ * and longwords folds to the same 16-bit result. */
+static ULONG zznet_mmio_copy(UBYTE *dst, volatile UBYTE *src, ULONG n, BOOL sum)
+{
+	ULONG acc = 0, v;
+
+	if (((ULONG)src & 2) && n >= 2) {
+		v = *(volatile USHORT*)src;
+		*(USHORT*)dst = (USHORT)v;
+		acc = v;
+		src += 2; dst += 2; n -= 2;
+	}
+	if (((ULONG)src & 3) == 0) {
+		volatile ULONG *ls = (volatile ULONG*)src;
+		ULONG longs = n >> 2;
+
+		if (sum) {
+			while (longs--) {
+				v = *ls++;
+				*(ULONG*)dst = v;
+				dst += 4;
+				acc += v;
+				if (acc < v)
+					acc++;
+			}
+		} else {
+			if (longs >= 8) {
+				zznet_copy_blocks((ULONG*)dst, ls, longs >> 3);
+				dst += (longs & ~7UL) << 2;
+				ls  += longs & ~7UL;
+				longs &= 7;
+			}
+			while (longs--) {
+				*(ULONG*)dst = *ls++;
+				dst += 4;
+			}
+		}
+		src = (volatile UBYTE*)ls;
+		n &= 3;
+	}
+	if (n >= 2) {
+		v = *(volatile USHORT*)src;
+		*(USHORT*)dst = (USHORT)v;
+		acc += v;
+		if (acc < v)
+			acc++;
+		src += 2; dst += 2; n -= 2;
+	}
+	if (n) {
+		v = (ULONG)*src << 8;
+		*dst = *src;
+		acc += v;
+		if (acc < v)
+			acc++;
+	}
+	return acc;
+}
+
+/* The direct receive of one frame (anxs2ext.h): the payload goes from
+ * the RX window into the buffer RxDirect(cookie) names, with the Ethernet
+ * header in the 14 bytes before it when `link_hdr` is set, and
+ * RxFilled(cookie) reports it. Returns 0 when RxDirect declined. Called
+ * before the frame is acked, so ETH_RX_META still describes it.
+ *
+ * Every frame goes up SUMMED unless the GEM's verdict already proves it:
+ * when the opener asked for VERIFIED and the GEM checked an IPv4 TCP or
+ * UDP frame, the payload is copied without summing and only the
+ * structural promises are checked; otherwise the copy carries the sum and
+ * VERIFIED, when asked for, comes from software over IPv4 or IPv6. A
+ * frame the GEM verdict cannot cover is copied again with the sum. */
+static int zznet_rx_fill(struct BufferManagement *bm, APTR cookie,
+                         volatile UBYTE *frame, ULONG plen, USHORT tp,
+                         BOOL link_hdr)
+{
+	volatile UBYTE *payload = frame + 4 + HW_ETH_HDR_SIZE;
+	BOOL verify = (bm->bm_ExtAccepted & ANXD_S2F_RX_VERIFIED) != 0;
+	UBYTE flags = 0;
+	ULONG sum = 0;
+	UBYTE *dst;
+
+	dst = bm->bm_Ext->RxDirect(cookie, plen);
+	if (!dst)
+		return 0;
+
+	if (verify && tp == 0x0800) {
+		USHORT meta = *(volatile USHORT*)(ZZ9K_REGS+ZZNET_RX_META);
+
+		if (meta & ZZNET_RX_META_PRESENT) {
+			unsigned verdict = meta & ZZNET_RX_META_VERDICT;
+
+			if (verdict == ZZNET_RX_META_TCP || verdict == ZZNET_RX_META_UDP) {
+				zznet_mmio_copy(dst, payload, plen, FALSE);
+				flags = zznet_ext_rx_trust4(dst, plen, verdict);
+			}
+		}
+	}
+	if (!flags) {
+		sum = zznet_mmio_copy(dst, payload, plen, TRUE);
+		flags = ANXD_S2_RXF_SUMMED;
+		if (verify && tp == 0x0800)
+			flags |= zznet_ext_rx_verify4(dst, plen, sum);
+		else if (verify && tp == 0x86dd)
+			flags |= zznet_ext_rx_verify6(dst, plen, sum);
+	}
+
+	if (link_hdr) {
+		/* The header frame_proc copied from the window (zznet_rx_hdr);
+		 * dst is only even, so the stores are words. */
+		const ULONG *h = zznet_rx_hdr;
+		USHORT *w = (USHORT*)(dst - HW_ETH_HDR_SIZE);
+		ULONG m;
+		int i;
+
+		for (i = 0; i < 3; i++) {
+			m = h[i];
+			w[2*i]   = (USHORT)(m >> 16);
+			w[2*i+1] = (USHORT)m;
+		}
+		w[6] = (USHORT)(zznet_rx_hdr[3] >> 16);
+	}
+	bm->bm_Ext->RxFilled(cookie, plen, sum, flags);
+	return 1;
+}
+
+/* Direct receive for a non-raw CMD_READ of an opener with
+ * ANXD_S2F_RX_DIRECT. Returns 0 when the frame is not for the direct path;
+ * the caller then copies it through S2_CopyToBuff as usual. */
+static int zznet_rx_direct(struct BufferManagement *bm, struct IOSana2Req *req,
+                           volatile UBYTE *frame, ULONG datasize, USHORT tp)
+{
+	if (!(bm->bm_ExtAccepted & ANXD_S2F_RX_DIRECT) ||
+	    (req->ios2_Req.io_Flags & SANA2IOF_RAW))
+		return 0;
+	if (!zznet_rx_fill(bm, req->ios2_Data, frame, datasize, tp,
+	                   (bm->bm_ExtAccepted & ANXD_S2F_RX_LINK_HDR) != 0))
+		return 0;
+	req->ios2_Req.io_Error = req->ios2_WireError = 0;
+	return 1;
+}
+
+/* One frame into an RX batch's next cookie, link header always (the batch
+ * has no per-frame request fields). Returns 0 when it was filled. A frame
+ * that does not fit a non-raw read, or that RxDirect declines, is lost to
+ * the batch; there is no other buffer to copy it to. */
+static ULONG zznet_rx_batch(struct IOSana2Req *req, volatile UBYTE *frame,
+                            USHORT sz, USHORT tp)
+{
+	struct BufferManagement *bm = (struct BufferManagement *)req->ios2_BufferManagement;
+	AnxdS2RxBatch *b = (AnxdS2RxBatch *)req->ios2_Data;
+
+	if (sz < HW_ETH_HDR_SIZE || sz > HW_ETH_MAX_STD ||
+	    !zznet_rx_fill(bm, b->Cookie[b->Filled], frame,
+	                   (ULONG)sz - HW_ETH_HDR_SIZE, tp, TRUE))
+		return 1;
+	b->Filled++;
+	return 0;
+}
+
 ULONG read_frame(DEVBASETYPE *db, struct IOSana2Req *req, volatile UBYTE *frame, USHORT sz, USHORT tp)
 {
 	struct BufferManagement *bm;
@@ -1106,7 +1590,7 @@ ULONG read_frame(DEVBASETYPE *db, struct IOSana2Req *req, volatile UBYTE *frame,
 	req->ios2_DataLength = datasize;
 
 	bm = (struct BufferManagement *)req->ios2_BufferManagement;
-	{
+	if (!zznet_rx_direct(bm, req, frame, datasize, tp)) {
 		/* SANA-II contract: bm_CopyToBuffer is a synchronous copy — it
 		 * reads `datasize` bytes from `source` into the client-owned
 		 * destination and returns success/failure of a completed copy.
@@ -1186,12 +1670,43 @@ ULONG read_frame(DEVBASETYPE *db, struct IOSana2Req *req, volatile UBYTE *frame,
 	return err;
 }
 
+/* Checksum offload for a frame already in the TX window at `start`
+ * (anxs2ext.h ANXD_S2_TXF_TCP/UDP): the opener left the pseudo-header sum
+ * in the TCP/UDP checksum field, and the GEM's insertion wants it zero.
+ * The field's offset comes from the frame's first bytes, taken again from
+ * the opener's buffer into RAM rather than read back over Zorro; only the
+ * card copy changes, since the stack may retransmit its own. */
+static void zznet_tx_csum(struct BufferManagement *bm, struct IOSana2Req *req,
+                          UBYTE *start, USHORT sz, UBYTE txf)
+{
+	UBYTE peek[HW_ETH_HDR_SIZE + 80];
+	ULONG have;
+	USHORT off;
+
+	if (req->ios2_Req.io_Flags & SANA2IOF_RAW) {
+		have = sz < sizeof(peek) ? sz : sizeof(peek);
+		if (!(*bm->bm_CopyFromBuffer)(peek, req->ios2_Data, have))
+			return;
+	} else {
+		have = sz < sizeof(peek) ? sz : sizeof(peek);
+		peek[12] = (UBYTE)(req->ios2_PacketType >> 8);
+		peek[13] = (UBYTE)req->ios2_PacketType;
+		if (!(*bm->bm_CopyFromBuffer)(peek + HW_ETH_HDR_SIZE, req->ios2_Data,
+		                              have - HW_ETH_HDR_SIZE))
+			return;
+	}
+	if (zznet_ext_tx_csum4(peek, have, sz, txf, &off))
+		*(volatile USHORT*)(start + off) = 0;
+}
+
 /* slot < 0: the synchronous send from the start of the TX window. slot
  * 0..3: an asynchronous send from that slot, which the caller has taken
- * from db_Tx under db_TxSem. */
-ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slot)
+ * from db_Tx under db_TxSem. txf: the ANXD_S2_TXF_* flags granted for
+ * this write (0 for a plain opener). */
+ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slot, UBYTE txf)
 {
 	struct BufferManagement *bm;
+	UBYTE *start = frame;
 	USHORT sz = 0;
 	ULONG  rc = 0;
 
@@ -1241,11 +1756,26 @@ ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slo
 		}
 	}
 
+	if (txf & (ANXD_S2_TXF_TCP | ANXD_S2_TXF_UDP))
+		zznet_tx_csum(bm, req, start, sz, txf);
+
 	if (slot >= 0) {
 		/* Queued, not sent: the bus cycle returns at once and the slot
 		 * stays the firmware's until ETH_TX_STATUS retires it. A refused
 		 * submission is retired the same way and cannot be told apart
-		 * from a sent one, so there is no result to read back. */
+		 * from a sent one, so there is no result to read back.
+		 *
+		 * ANXD_S2_TXF_MORE: the opener sends a run back to back, so the
+		 * start is held until the run ends (ANXD_CMD_TX_FLUSH), a write
+		 * without the flag, all four slots holding frames, or the next
+		 * vertical blank; the frames then leave together. */
+		if (txf & ANXD_S2_TXF_MORE) {
+			zznet_tx_hold(&db->db_Tx, zznet_tx_word(slot, sz));
+			if (db->db_Tx.held >= ZZNET_TX_SLOTS)
+				zznet_tx_flush(db);
+			return 0;
+		}
+		zznet_tx_flush(db);
 		*(volatile USHORT*)(ZZ9K_REGS+0x80) = zznet_tx_word(slot, sz);
 		zznet_tx_submitted(&db->db_Tx);
 		return 0;
@@ -1267,7 +1797,16 @@ ULONG write_frame(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE *frame, int slo
  * for the firmware to retire the oldest one while all four are in flight.
  * A slot is reused only after ETH_TX_STATUS has counted its frame, so the
  * copy into it can never overwrite a frame the GEM is still reading. */
-static ULONG write_frame_async(DEVBASETYPE *db, struct IOSana2Req *req)
+/* Start every held frame, oldest first. Under db_TxSem. */
+static void zznet_tx_flush(DEVBASETYPE *db)
+{
+	USHORT word;
+
+	while ((word = zznet_tx_unhold(&db->db_Tx)))
+		*(volatile USHORT*)(ZZ9K_REGS+0x80) = word;
+}
+
+static ULONG write_frame_async(DEVBASETYPE *db, struct IOSana2Req *req, UBYTE txf)
 {
 	ULONG rc = 1;
 	ULONG reads;
@@ -1279,13 +1818,16 @@ static ULONG write_frame_async(DEVBASETYPE *db, struct IOSana2Req *req)
 
 	ObtainSemaphore(&db->db_TxSem);
 	for (reads = 0; (slot = zznet_tx_slot(&db->db_Tx)) < 0 &&
-	                reads < ZZNET_TX_WAIT_READS; reads++)
+	                reads < ZZNET_TX_WAIT_READS; reads++) {
+		/* Held frames only retire once started. */
+		zznet_tx_flush(db);
 		zznet_tx_reclaim(&db->db_Tx,
 		                 *(volatile USHORT*)(ZZ9K_REGS+ZZ9K_TX_STATUS));
+	}
 	if (slot >= 0) {
 		rc = write_frame(db, req,
 		                 (UBYTE*)(ZZ9K_REGS + ZZ9K_TX +
-		                          (ULONG)slot * ZZNET_TX_SLOT_SIZE), slot);
+		                          (ULONG)slot * ZZNET_TX_SLOT_SIZE), slot, txf);
 	} else {
 		D(("tx: no slot retired\n"));
 	}
@@ -1316,7 +1858,7 @@ SAVEDS void frame_proc() {
   ObtainSemaphore(&db->db_ProcExitSem);
   ReplyMsg((struct Message*)init);
 
-  wmask = SIGBREAKF_CTRL_F | SIGBREAKF_CTRL_C;
+  wmask = SIGBREAKF_CTRL_F | SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_E;
 
   struct zznet_rx_state rx_state;
   zznet_rx_reset(&rx_state,
@@ -1326,6 +1868,7 @@ SAVEDS void frame_proc() {
   volatile UBYTE*  frm       = (volatile UBYTE*)(ZZ9K_REGS+ZZ9K_RX);
   volatile USHORT* rx_accept = (volatile USHORT*)(ZZ9K_REGS+0x82);
   volatile USHORT* irq_ctrl  = (volatile USHORT*)(ZZ9K_REGS+0x04);
+  UWORD pass = 0;   /* frames since the RX batches were last answered */
 
   while (1) {
     struct IOSana2Req *ior;
@@ -1335,6 +1878,21 @@ SAVEDS void frame_proc() {
       break;
     }
 
+    /* TX_MORE backstop from the vertical blank: start held frames. */
+    if (db->db_Tx.held &&
+        (SetSignal(0, SIGBREAKF_CTRL_E) & SIGBREAKF_CTRL_E)) {
+      ObtainSemaphore(&db->db_TxSem);
+      zznet_tx_flush(db);
+      ReleaseSemaphore(&db->db_TxSem);
+    }
+
+    /* A long pass still answers its RX batches regularly. */
+    if (++pass >= ZZNET_EXT_BATCH_MAX) {
+      pass = 0;
+      zznet_batch_flush(db);
+    }
+
+    struct zznet_rx_state rx_prev = rx_state;
     struct zznet_rx_decision d = zznet_rx_next(&rx_state, &zznet_rx_hw);
     USHORT sz = d.size, serial = d.serial;
 
@@ -1348,6 +1906,7 @@ SAVEDS void frame_proc() {
        * ISR can wake us, then sleep. Enable-before-wait is correct: if a
        * frame raced in between our header read and the enable, the ISR
        * will signal and Wait returns immediately. */
+      zznet_batch_flush(db);
       *irq_ctrl = 1;
       recv = Wait(wmask);
       continue;
@@ -1386,6 +1945,7 @@ SAVEDS void frame_proc() {
      * outside the semaphore keeps DevAbortIO / CMD_READ unblocked for
      * the duration of the Zorro bus copy. */
     ObtainSemaphore(&db->db_ReadListSem);
+    db->db_RxBehind = 0;
     for (ior = (struct IOSana2Req *)db->db_ReadList.lh_Head;
          ior->ios2_Req.io_Message.mn_Node.ln_Succ;
          ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {
@@ -1395,9 +1955,44 @@ SAVEDS void frame_proc() {
         break;
       }
     }
+    if (!match && zznet_rx_hold(db, packet_type))
+      db->db_RxBehind = 1;
     ReleaseSemaphore(&db->db_ReadListSem);
 
-    if (match) {
+    if (db->db_RxBehind) {
+      /* Leave the frame presented and unacked for the sole opener's next
+       * read (anxs2ext.h, ANXD_CMD_RX_POLL). Its counters are taken when
+       * it is delivered, and the model forgets it was seen. The card IRQ
+       * stays masked, since the firmware would raise it again at once;
+       * posting a read, polling, opening or closing wakes us instead. */
+      rx_state = rx_prev;
+      global_stats.BadData  -= d.bad_data;
+      global_stats.Overruns -= d.overruns;
+      zznet_batch_flush(db);
+      recv = Wait(wmask);
+      continue;
+    }
+
+    if (match && match->ios2_Req.io_Command == ANXD_CMD_RX_BATCH) {
+      if (zznet_rx_batch(match, frm, sz, packet_type) == 0) {
+        global_stats.PacketsReceived++;
+      } else {
+        global_stats.UnknownTypesReceived++;
+      }
+      if (((AnxdS2RxBatch *)match->ios2_Data)->Filled >=
+          ((AnxdS2RxBatch *)match->ios2_Data)->Count) {
+        match->ios2_Req.io_Error = match->ios2_WireError = 0;
+        ReplyMsg((struct Message *)match);
+      } else {
+        /* Back at the head, still first for its type; answered at the
+         * end of this pass if nothing fills it first. */
+        ObtainSemaphore(&db->db_ReadListSem);
+        AddHead((struct List*)&db->db_ReadList, (struct Node*)match);
+        ReleaseSemaphore(&db->db_ReadListSem);
+        if (((AnxdS2RxBatch *)match->ios2_Data)->Filled)
+          db->db_BatchPending = 1;
+      }
+    } else if (match) {
       ULONG res = read_frame(db, match, frm, sz, packet_type);
       if (res == 0) {
         global_stats.PacketsReceived++;

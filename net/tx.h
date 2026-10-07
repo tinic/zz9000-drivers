@@ -34,8 +34,10 @@
 
 struct zznet_tx_state {
 	uint16_t done;   /* retired count last read from ETH_TX_STATUS */
-	uint8_t  next;   /* submissions so far, modulo 256; slot = next & 3 */
-	uint8_t  inuse;  /* submitted and not yet retired */
+	uint8_t  next;   /* slots taken so far, modulo 256; slot = next & 3 */
+	uint8_t  inuse;  /* slots taken and not yet retired, held included */
+	uint8_t  held;   /* filled, ETH_TX write not yet issued (TX_MORE) */
+	uint16_t held_word[ZZNET_TX_SLOTS]; /* their ETH_TX words, in order */
 };
 
 /* status is the ETH_TX_STATUS value; returns 1 when the firmware has the
@@ -43,8 +45,9 @@ struct zznet_tx_state {
 int zznet_tx_reset(struct zznet_tx_state *state, uint16_t status);
 
 /* Retire what the status count says finished. Returns the slots freed. A
- * count that ran further than what is outstanding (firmware restarted
- * underneath us) frees everything, never more. */
+ * count that ran further than what was submitted (firmware restarted
+ * underneath us) frees everything submitted, never more; a held slot was
+ * never submitted, so the firmware cannot have retired it. */
 unsigned zznet_tx_reclaim(struct zznet_tx_state *state, uint16_t status);
 
 /* The slot the next submission must use, or -1 while all four are owned
@@ -56,5 +59,13 @@ uint16_t zznet_tx_word(int slot, uint16_t len);
 
 /* Record a submission written with zznet_tx_word(zznet_tx_slot(), ...). */
 void zznet_tx_submitted(struct zznet_tx_state *state);
+
+/* Take the slot for a frame whose start is held back (ANXD_S2_TXF_MORE):
+ * `word` is what zznet_tx_word() gave, issued later in order. */
+void zznet_tx_hold(struct zznet_tx_state *state, uint16_t word);
+
+/* The oldest held ETH_TX word, to be written now, or 0 when none is
+ * held. Held words are issued oldest first and before any later frame. */
+uint16_t zznet_tx_unhold(struct zznet_tx_state *state);
 
 #endif /* ZZNET_TX_H */

@@ -6,6 +6,7 @@ int zznet_tx_reset(struct zznet_tx_state *state, uint16_t status)
 	state->done = (uint16_t)(status & ZZNET_TX_STATUS_COUNT);
 	state->next = 0;
 	state->inuse = 0;
+	state->held = 0;
 	return (status & ZZNET_TX_STATUS_PRESENT) != 0;
 }
 
@@ -17,10 +18,10 @@ unsigned zznet_tx_reclaim(struct zznet_tx_state *state, uint16_t status)
 	/* Nothing of ours outstanding: whatever moved the count was not ours
 	 * to free, but the baseline still follows it. */
 	state->done = now;
-	if (state->inuse == 0)
+	if (state->inuse == state->held)
 		return 0;
-	if (n > state->inuse)
-		n = state->inuse;
+	if (n > state->inuse - state->held)
+		n = (uint16_t)(state->inuse - state->held);
 	state->inuse = (uint8_t)(state->inuse - n);
 	return n;
 }
@@ -43,4 +44,25 @@ void zznet_tx_submitted(struct zznet_tx_state *state)
 {
 	state->next++;
 	state->inuse++;
+}
+
+void zznet_tx_hold(struct zznet_tx_state *state, uint16_t word)
+{
+	state->held_word[state->held++] = word;
+	state->next++;
+	state->inuse++;
+}
+
+uint16_t zznet_tx_unhold(struct zznet_tx_state *state)
+{
+	uint16_t word;
+	unsigned i;
+
+	if (state->held == 0)
+		return 0;
+	word = state->held_word[0];
+	state->held--;
+	for (i = 0; i < state->held; i++)
+		state->held_word[i] = state->held_word[i + 1];
+	return word;
 }

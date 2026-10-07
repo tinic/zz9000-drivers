@@ -165,6 +165,41 @@ int main(void)
 	CHECK(zznet_tx_reclaim(&s, ZZNET_TX_STATUS_PRESENT | 0x1240) == 0);
 	CHECK(s.done == 0x1240);
 
+	/* Held starts (TX_MORE): slots are taken, nothing retires until they
+	 * are issued, and they are issued oldest first. */
+	memset(&f, 0, sizeof(f));
+	zznet_tx_reset(&s, fw_status(&f));
+	CHECK(zznet_tx_slot(&s) == 0);
+	zznet_tx_hold(&s, zznet_tx_word(0, 60));
+	CHECK(zznet_tx_slot(&s) == 1);
+	zznet_tx_hold(&s, zznet_tx_word(1, 61));
+	CHECK(s.inuse == 2 && s.held == 2);
+	/* A count that runs ahead cannot free a slot never submitted. */
+	CHECK(zznet_tx_reclaim(&s, ZZNET_TX_STATUS_PRESENT | 5) == 0);
+	s.done = 0;
+	{
+		uint16_t w;
+
+		w = zznet_tx_unhold(&s);
+		CHECK(w == zznet_tx_word(0, 60));
+		CHECK(fw_submit(&f, w, 1));
+		w = zznet_tx_unhold(&s);
+		CHECK(w == zznet_tx_word(1, 61));
+		CHECK(fw_submit(&f, w, 1));
+		CHECK(zznet_tx_unhold(&s) == 0);
+	}
+	CHECK(s.held == 0 && s.inuse == 2);
+	CHECK(submit(&s, &f, 1) == 2);
+	fw_complete(&f);
+	CHECK(zznet_tx_reclaim(&s, fw_status(&f)) == 1);
+	CHECK(s.inuse == 2);
+	/* Held behind submitted frames: only the submitted ones retire. */
+	zznet_tx_hold(&s, zznet_tx_word(zznet_tx_slot(&s), 62));
+	fw_complete(&f);
+	fw_complete(&f);
+	CHECK(zznet_tx_reclaim(&s, fw_status(&f)) == 2);
+	CHECK(s.inuse == 1 && s.held == 1);
+
 	/* Length word layout. */
 	CHECK(zznet_tx_word(3, 1518) == (0x8000 | (3 << 11) | 1518));
 
