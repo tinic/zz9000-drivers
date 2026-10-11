@@ -32,6 +32,8 @@ static const struct expected_mode expected_modes[] = {
 	{ 1600, 1200, 1600, 1200, 10, 2160, 1242, 161538462U, 60.21443 },
 	{ 2560, 1440, 2560, 1440, 11, 3328, 1465, 146428571U, 30.03343 },
 	{ 1920,  800, 1920,  800, 17, 2528,  828, 125000000U, 59.71764 },
+	{  960,  540, 1920, 1080,  5, 2200, 1125, 148571429U, 60.02886 },
+	{  640,  360, 1280,  720,  0, 1650,  750,  75000000U, 60.60606 },
 };
 
 static int check_mode(const struct expected_mode *expected)
@@ -89,6 +91,18 @@ int main(void)
 
 	if (zz_rtg_mode_timing_for_logical_size(1366, 768) != NULL) {
 		fprintf(stderr, "FAIL unsupported 1366x768 returned a timing\n");
+		ok = 0;
+	}
+
+	if (zz_rtg_mode_timing_scale(zz_rtg_mode_timing_for_logical_size(960, 540), 960) != 3 ||
+	    zz_rtg_mode_timing_scale(zz_rtg_mode_timing_for_logical_size(1920, 1080), 1920) != 0 ||
+	    zz_rtg_mode_timing_scale(zz_rtg_mode_timing_for_logical_size(320, 240), 320) != 3) {
+		fprintf(stderr, "FAIL scale bits for doubled/native presets\n");
+		ok = 0;
+	}
+
+	if (zz_rtg_mode_timing_for_logical_size(683, 384) != NULL) {
+		fprintf(stderr, "FAIL half of unsupported 1366x768 returned a timing\n");
 		ok = 0;
 	}
 

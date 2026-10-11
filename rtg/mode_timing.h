@@ -51,15 +51,33 @@ zz_rtg_mode_timing_for_output_size(uint16_t width, uint16_t height)
 	return NULL;
 }
 
+/* Modes below 640x480 are always doubled. A larger mode with no preset of
+ * its own is doubled when twice its size is a preset, e.g. 960x540 shown
+ * pixel-doubled in the 1920x1080 frame (an exact 4x on a 4K display). */
 static inline const struct zz_rtg_mode_timing *
 zz_rtg_mode_timing_for_logical_size(uint16_t width, uint16_t height)
 {
+	const struct zz_rtg_mode_timing *timing;
+
 	if (width < 640 && height < 480) {
 		width = (uint16_t)(width * 2U);
 		height = (uint16_t)(height * 2U);
 	}
 
-	return zz_rtg_mode_timing_for_output_size(width, height);
+	timing = zz_rtg_mode_timing_for_output_size(width, height);
+	if (!timing && width <= 0x7fffU && height <= 0x7fffU)
+		timing = zz_rtg_mode_timing_for_output_size(
+			(uint16_t)(width * 2U), (uint16_t)(height * 2U));
+
+	return timing;
+}
+
+/* Scale bits for the mode register: 3 (double both axes) when the preset
+ * frame is twice the logical size. */
+static inline uint16_t zz_rtg_mode_timing_scale(
+	const struct zz_rtg_mode_timing *timing, uint16_t width)
+{
+	return timing && timing->width != width ? 3U : 0U;
 }
 
 #endif

@@ -62,18 +62,22 @@ struct zz_modeline_plan {
 };
 
 /* Fixed-preset selection by output dimensions only, exactly like the
- * pre-custom-modeline driver: modes below 640x480 logical size are
- * doubled and scaled 2x inside a larger preset sync frame. Unknown
- * dimensions yield NULL (the caller refuses the mode). */
+ * pre-custom-modeline driver: modes below 640x480 logical size, and
+ * larger modes that are exactly half a preset (960x540), are doubled and
+ * scaled 2x inside the preset sync frame. Unknown dimensions yield NULL
+ * (the caller refuses the mode). */
 static inline const struct zz_rtg_mode_timing *zz_p96_preset_for_dimensions(
 	const struct zz_p96_mode *p96, uint16_t *scale)
 {
+	const struct zz_rtg_mode_timing *timing;
+
 	if (p96->width < ZZ_CUSTOM_MIN_WIDTH ||
 	    p96->height < ZZ_CUSTOM_MIN_HEIGHT)
 		return NULL;
 
-	*scale = p96->width < 640 && p96->height < 480 ? 3 : 0;
-	return zz_rtg_mode_timing_for_logical_size(p96->width, p96->height);
+	timing = zz_rtg_mode_timing_for_logical_size(p96->width, p96->height);
+	*scale = zz_rtg_mode_timing_scale(timing, p96->width);
+	return timing;
 }
 
 /* Exact-match variant for firmware with the custom-mode capability:

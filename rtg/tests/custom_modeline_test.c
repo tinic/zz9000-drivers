@@ -177,13 +177,14 @@ static void test_every_preset_stays_preset(void)
 
 static void test_lowres_doubling_stays_preset(void)
 {
-	/* 320x200/320x240/320x256 are doubled into larger presets with
-	 * the sync offsets kept relative to the logical active area */
-	static const uint16_t widths[] = { 320, 320, 320 };
-	static const uint16_t heights[] = { 200, 240, 256 };
+	/* 320x200/320x240/320x256, and 960x540/640x360 (exactly half a
+	 * preset), are doubled into larger presets with the sync offsets
+	 * kept relative to the logical active area */
+	static const uint16_t widths[] = { 320, 320, 320, 960, 640 };
+	static const uint16_t heights[] = { 200, 240, 256, 540, 360 };
 	unsigned i;
 
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < 5; i++) {
 		const struct zz_rtg_mode_timing *timing =
 			zz_rtg_mode_timing_for_output_size(
 				(uint16_t)(widths[i] * 2U),
